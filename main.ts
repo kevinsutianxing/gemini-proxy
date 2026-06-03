@@ -1,5 +1,3 @@
-import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
-
 // Gemini API 基础 URL
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com";
 
@@ -287,4 +285,4 @@ async function handler(req: Request): Promise<Response> {
 }
 
 console.log("Gemini API 代理服务器已启动...");
-serve(handler);
+Deno.serve(handler);
