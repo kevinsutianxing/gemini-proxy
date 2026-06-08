@@ -1,8 +1,9 @@
 // === 统一 API 代理服务器 ===
-// 支持同时代理 OpenAI 和 Gemini API
+// 支持同时代理 OpenAI、Gemini、Codex (ChatGPT Plus) API
 // 路由规则：
 //   /openai/* → 转发到 OpenAI API（Authorization Bearer 方式认证）
 //   /gemini/* → 转发到 Gemini API（URL ?key= 方式认证）
+//   /codex/*  → 转发到 ChatGPT Codex API（Authorization Bearer OAuth token）
 //   /v1/* → 默认转发到 OpenAI API（向后兼容）
 // 其他路径 → 返回使用说明
 
@@ -12,6 +13,7 @@ const OPENAI_API_KEYS_STR = Deno.env.get("openai_apikey"); // OpenAI API 密钥�
 const GEMINI_API_KEYS_STR = Deno.env.get("gemini_apikey"); // Gemini API 密钥（逗号分隔）
 const OPENAI_BASE_URL = Deno.env.get("openai_base_url") || "https://api.openai.com";
 const GEMINI_BASE_URL = Deno.env.get("gemini_base_url") || "https://generativelanguage.googleapis.com";
+const CODEX_BASE_URL = Deno.env.get("codex_base_url") || "https://chatgpt.com/backend-api/codex";
 
 // ── 兼容旧配置（如果新变量没设置，fallback 到旧的 apikey） ──
 const OPENAI_API_KEYS = parseKeys(OPENAI_API_KEYS_STR || Deno.env.get("apikey") || "");
@@ -39,8 +41,9 @@ console.log(`OpenAI Keys: ${OPENAI_API_KEYS.length} 个`);
 console.log(`Gemini Keys: ${GEMINI_API_KEYS.length} 个`);
 console.log(`OpenAI 后端: ${OPENAI_BASE_URL}`);
 console.log(`Gemini 后端: ${GEMINI_BASE_URL}`);
+console.log(`Codex 后端: ${CODEX_BASE_URL}`);
 console.log("================================");
-console.log("路由: /openai/* → OpenAI | /gemini/* → Gemini | /v1/* → OpenAI(兼容)");
+console.log("路由: /openai/* → OpenAI | /gemini/* → Gemini | /codex/* → Codex | /v1/* → OpenAI(兼容)");
 
 // ── CORS ──
 function corsHeaders(): Record<string, string> {
@@ -48,7 +51,9 @@ function corsHeaders(): Record<string, string> {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers":
-      "Content-Type, Authorization, x-api-key, x-goog-api-key, OpenAI-Beta, OpenAI-Organization",
+      "Content-Type, Authorization, x-api-key, x-goog-api-key, OpenAI-Beta, OpenAI-Organization, " +
+      "Originator, Chatgpt-Account-Id, Session_id, X-Codex-Turn-Metadata, X-Client-Request-Id, " +
+      "Thread-Id, X-Codex-Window-Id, X-Codex-Beta-Features",
     "Access-Control-Max-Age": "86400",
   };
 }
@@ -94,11 +99,12 @@ function verifyClient(req: Request, requestId: string): string | null {
 }
 
 // ── 路由解析 ──
-type RouteTarget = "openai" | "gemini" | "help";
+type RouteTarget = "openai" | "gemini" | "codex" | "help";
 
 function resolveRoute(pathname: string): RouteTarget {
   if (pathname.startsWith("/openai/") || pathname === "/openai") return "openai";
   if (pathname.startsWith("/gemini/") || pathname === "/gemini") return "gemini";
+  if (pathname.startsWith("/codex/") || pathname === "/codex") return "codex";
   // /v1/ 默认走 OpenAI（向后兼容原 openai-proxy）
   if (pathname.startsWith("/v1/")) return "openai";
   return "help";
@@ -230,6 +236,88 @@ async function proxyGemini(
   return buildResponse(resp, requestId, isStream, elapsed, GEMINI_API_KEYS.length, selectedKey);
 }
 
+// ── Codex 代理逻辑（新增） ──
+// Codex 路由将 /codex/* 转发到 https://chatgpt.com/backend-api/codex/*
+// 认证：CLIProxyAPI 管理 OAuth token，通过 Authorization Bearer 传递
+// 本代理只做透传，不做 key 轮换
+async function proxyCodex(
+  req: Request,
+  url: URL,
+  requestId: string,
+): Promise<Response> {
+  // 去掉路径前缀 /codex
+  let targetPath = url.pathname;
+  if (targetPath.startsWith("/codex")) {
+    targetPath = targetPath.substring(6); // /codex/responses → /responses
+  }
+  if (targetPath === "") targetPath = "/responses";
+
+  const targetUrl = `${CODEX_BASE_URL}${targetPath}${url.search}`;
+  console.log(`[${requestId}] Codex 转发: ${targetUrl}`);
+
+  // 透传所有 Codex 相关 headers
+  const forwardHeaders = new Headers();
+  for (const h of [
+    "Content-Type", "Accept", "User-Agent", "Accept-Language",
+    "Accept-Encoding",
+    // Codex 特有 headers — 完整透传
+    "Authorization",       // OAuth access token (CLIProxyAPI 管理)
+    "Originator",          // codex_cli_rs/codex-tui
+    "Chatgpt-Account-Id",  // 账户 ID
+    "Session_id",          // 会话 ID
+    "X-Codex-Turn-Metadata",
+    "X-Client-Request-Id",
+    "Thread-Id",
+    "X-Codex-Window-Id",
+    "X-Codex-Beta-Features",
+  ]) {
+    const v = req.headers.get(h);
+    if (v) forwardHeaders.set(h, v);
+  }
+
+  // 读取请求体 & 检测流式
+  let body: ArrayBuffer | undefined;
+  let isStream = false;
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    body = await req.arrayBuffer();
+    try {
+      const text = new TextDecoder().decode(body);
+      // Codex 用的是 OpenAI responses API 格式，stream 在 body 里
+      if (text.includes('"stream"')) {
+        const parsed = JSON.parse(text);
+        if (parsed.stream === true) isStream = true;
+      }
+    } catch { /* ignore */ }
+    console.log(`[${requestId}] Codex 请求体: ${body.byteLength} bytes, stream=${isStream}`);
+  }
+
+  const startTime = Date.now();
+  const resp = await fetch(targetUrl, {
+    method: req.method,
+    headers: forwardHeaders,
+    body,
+  });
+  const elapsed = Date.now() - startTime;
+
+  console.log(`[${requestId}] Codex 响应: ${resp.status} (${elapsed}ms)`);
+  if (resp.status === 429) console.warn(`[${requestId}] ⚠️ Codex 限速`);
+  if (resp.status === 401 || resp.status === 403) {
+    console.warn(`[${requestId}] ⚠️ Codex 认证/授权失败: ${resp.status}`);
+  }
+
+  // Codex 用流式 SSE，直接透传
+  const headers = new Headers();
+  for (const h of ["Content-Type", "Content-Length", "Content-Encoding", "Transfer-Encoding"]) {
+    const v = resp.headers.get(h);
+    if (v) headers.set(h, v);
+  }
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("X-Proxy-Request-ID", requestId);
+  headers.set("X-Response-Time", `${elapsed}ms`);
+
+  return new Response(resp.body, { status: resp.status, headers });
+}
+
 // ── 构建统一响应 ──
 function buildResponse(
   resp: Response,
@@ -274,7 +362,7 @@ function helpResponse(): Response {
   return new Response(
     JSON.stringify({
       name: "统一 API 代理",
-      version: "1.0.0",
+      version: "2.0.0",
       routes: {
         "/openai/*": {
           target: "OpenAI API",
@@ -285,6 +373,11 @@ function helpResponse(): Response {
           target: "Google Gemini API",
           example: "POST /gemini/v1beta/models/gemini-pro:generateContent",
           note: "Key 通过 URL ?key= 传递",
+        },
+        "/codex/*": {
+          target: "ChatGPT Codex API (ChatGPT Plus/Pro)",
+          example: "POST /codex/responses",
+          note: "OAuth token 通过 Authorization Bearer 传递，透传所有 Codex headers",
         },
         "/v1/*": {
           target: "OpenAI API (兼容旧地址)",
@@ -333,6 +426,9 @@ async function handler(req: Request): Promise<Response> {
   }
   if (route === "gemini") {
     return proxyGemini(req, url, requestId);
+  }
+  if (route === "codex") {
+    return proxyCodex(req, url, requestId);
   }
 
   return errorResponse("未知路由", 404, requestId);
