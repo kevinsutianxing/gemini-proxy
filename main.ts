@@ -197,10 +197,10 @@ async function proxyGemini(
   if (targetPath === "") targetPath = "/v1beta/models/gemini-pro:generateContent";
 
   // 替换 URL 中的 key 参数
-  const targetUrlObj = new URL(url.search);
-  targetUrlObj.searchParams.delete("key");
-  targetUrlObj.searchParams.set("key", selectedKey);
-  const targetUrl = `${GEMINI_BASE_URL}${targetPath}${targetUrlObj.search}`;
+  const searchParams = new URLSearchParams(url.search);
+  searchParams.delete("key");
+  searchParams.set("key", selectedKey);
+  const targetUrl = `${GEMINI_BASE_URL}${targetPath}?${searchParams.toString()}`;
   console.log(`[${requestId}] Gemini 转发: ${targetPath}`);
 
   // 准备转发 headers
