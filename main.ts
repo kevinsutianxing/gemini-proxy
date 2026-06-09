@@ -192,7 +192,7 @@ async function proxyGemini(
   // 去掉路径前缀 /gemini
   let targetPath = url.pathname;
   if (targetPath.startsWith("/gemini")) {
-    targetPath = targetPath.substring(6); // /gemini/v1beta/models → /v1beta/models
+    targetPath = targetPath.substring(7); // /gemini/v1beta/models → /v1beta/models
   }
   if (targetPath === "") targetPath = "/v1beta/models/gemini-pro:generateContent";
 
