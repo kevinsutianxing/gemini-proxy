@@ -413,13 +413,17 @@ async function handler(req: Request): Promise<Response> {
     return helpResponse();
   }
 
-  // 验证客户端
-  const authError = verifyClient(req, requestId);
-  if (authError) {
-    return errorResponse(authError, 401, requestId);
+  // Codex 路由跳过 AUTH_KEY 验证——直接透传 OAuth token
+  // （Codex 认证由上游 chatgpt.com 处理，不需要我们的代理密钥）
+  if (route !== "codex") {
+    const authError = verifyClient(req, requestId);
+    if (authError) {
+      return errorResponse(authError, 401, requestId);
+    }
+    console.log(`[${requestId}] 认证成功 → 路由: ${route}`);
+  } else {
+    console.log(`[${requestId}] Codex 路由 → 跳过代理认证，透传 OAuth token`);
   }
-
-  console.log(`[${requestId}] 认证成功 → 路由: ${route}`);
 
   if (route === "openai") {
     return proxyOpenAI(req, url, requestId);
