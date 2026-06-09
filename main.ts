@@ -4,6 +4,7 @@
 //   /openai/* → 转发到 OpenAI API（Authorization Bearer 方式认证）
 //   /gemini/* → 转发到 Gemini API（URL ?key= 方式认证）
 //   /codex/*  → 转发到 ChatGPT Codex API（Authorization Bearer OAuth token）
+//   /auth/*   → 转发到 auth.openai.com（OAuth/device flow，用于 Codex 登录）
 //   /v1/* → 默认转发到 OpenAI API（向后兼容）
 // 其他路径 → 返回使用说明
 
@@ -14,6 +15,7 @@ const GEMINI_API_KEYS_STR = Deno.env.get("gemini_apikey"); // Gemini API 密钥�
 const OPENAI_BASE_URL = Deno.env.get("openai_base_url") || "https://api.openai.com";
 const GEMINI_BASE_URL = Deno.env.get("gemini_base_url") || "https://generativelanguage.googleapis.com";
 const CODEX_BASE_URL = Deno.env.get("codex_base_url") || "https://chatgpt.com/backend-api/codex";
+const AUTH_BASE_URL = "https://auth.openai.com";
 
 // ── 兼容旧配置（如果新变量没设置，fallback 到旧的 apikey） ──
 const OPENAI_API_KEYS = parseKeys(OPENAI_API_KEYS_STR || Deno.env.get("apikey") || "");
@@ -43,7 +45,7 @@ console.log(`OpenAI 后端: ${OPENAI_BASE_URL}`);
 console.log(`Gemini 后端: ${GEMINI_BASE_URL}`);
 console.log(`Codex 后端: ${CODEX_BASE_URL}`);
 console.log("================================");
-console.log("路由: /openai/* → OpenAI | /gemini/* → Gemini | /codex/* → Codex | /v1/* → OpenAI(兼容)");
+console.log("路由: /openai/* → OpenAI | /gemini/* → Gemini | /codex/* → Codex | /auth/* → Auth | /v1/* → OpenAI(兼容)");
 
 // ── CORS ──
 function corsHeaders(): Record<string, string> {
@@ -99,12 +101,13 @@ function verifyClient(req: Request, requestId: string): string | null {
 }
 
 // ── 路由解析 ──
-type RouteTarget = "openai" | "gemini" | "codex" | "help";
+type RouteTarget = "openai" | "gemini" | "codex" | "auth" | "help";
 
 function resolveRoute(pathname: string): RouteTarget {
   if (pathname.startsWith("/openai/") || pathname === "/openai") return "openai";
   if (pathname.startsWith("/gemini/") || pathname === "/gemini") return "gemini";
   if (pathname.startsWith("/codex/") || pathname === "/codex") return "codex";
+  if (pathname.startsWith("/auth/")) return "auth";
   // /v1/ 默认走 OpenAI（向后兼容原 openai-proxy）
   if (pathname.startsWith("/v1/")) return "openai";
   return "help";
@@ -318,6 +321,73 @@ async function proxyCodex(
   return new Response(resp.body, { status: resp.status, headers });
 }
 
+// ── Auth 代理逻辑（auth.openai.com 透传） ──
+// 用于 CLIProxyAPI 的 Codex OAuth device code flow
+// 透传所有 headers 和 body，不做认证拦截
+async function proxyAuth(
+  req: Request,
+  url: URL,
+  requestId: string,
+): Promise<Response> {
+  // 去掉路径前缀 /auth
+  let targetPath = url.pathname;
+  if (targetPath.startsWith("/auth")) {
+    targetPath = targetPath.substring(5); // /auth/oauth/authorize → /oauth/authorize
+  }
+  if (targetPath === "") targetPath = "/";
+
+  const targetUrl = `${AUTH_BASE_URL}${targetPath}${url.search}`;
+  console.log(`[${requestId}] Auth 转发: ${targetUrl}`);
+
+  // 透传所有 headers
+  const forwardHeaders = new Headers();
+  for (const [k, v] of req.headers.entries()) {
+    // 跳过 host 和代理相关的 headers
+    const lower = k.toLowerCase();
+    if (lower === "host" || lower === "x-forwarded-for" || lower === "x-real-ip") continue;
+    forwardHeaders.set(k, v);
+  }
+  // 设置正确的 host
+  forwardHeaders.set("Host", "auth.openai.com");
+  forwardHeaders.set("Origin", "https://auth.openai.com");
+  forwardHeaders.set("Referer", "https://auth.openai.com/");
+
+  // 读取请求体
+  let body: ArrayBuffer | undefined;
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    body = await req.arrayBuffer();
+    console.log(`[${requestId}] Auth 请求体: ${body.byteLength} bytes`);
+  }
+
+  const startTime = Date.now();
+  const resp = await fetch(targetUrl, {
+    method: req.method,
+    headers: forwardHeaders,
+    body,
+    redirect: "manual", // 不自动跟随重定向，让客户端处理
+  });
+  const elapsed = Date.now() - startTime;
+
+  console.log(`[${requestId}] Auth 响应: ${resp.status} (${elapsed}ms)`);
+
+  // 透传响应
+  const headers = new Headers();
+  for (const [k, v] of resp.headers.entries()) {
+    const lower = k.toLowerCase();
+    if (lower === "location") {
+      // 重写重定向 URL 中的 auth.openai.com 为代理地址
+      headers.set(k, v.replace(/https?:\/\/auth\.openai\.com/g, `${url.origin}/auth`));
+    } else {
+      headers.set(k, v);
+    }
+  }
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("X-Proxy-Request-ID", requestId);
+  headers.set("X-Response-Time", `${elapsed}ms`);
+
+  return new Response(resp.body, { status: resp.status, headers });
+}
+
 // ── 构建统一响应 ──
 function buildResponse(
   resp: Response,
@@ -379,6 +449,11 @@ function helpResponse(): Response {
           example: "POST /codex/responses",
           note: "OAuth token 通过 Authorization Bearer 传递，透传所有 Codex headers",
         },
+        "/auth/*": {
+          target: "auth.openai.com 透传（用于 Codex OAuth 登录）",
+          example: "POST /auth/api/accounts/deviceauth/usercode",
+          note: "透传所有 headers，用于 device code flow，需要 AUTH_KEY",
+        },
         "/v1/*": {
           target: "OpenAI API (兼容旧地址)",
           example: "POST /v1/chat/completions",
@@ -413,16 +488,17 @@ async function handler(req: Request): Promise<Response> {
     return helpResponse();
   }
 
-  // Codex 路由跳过 AUTH_KEY 验证——直接透传 OAuth token
-  // （Codex 认证由上游 chatgpt.com 处理，不需要我们的代理密钥）
-  if (route !== "codex") {
+  // Codex 和 Auth 路由跳过 AUTH_KEY 验证
+  // Codex：认证由上游 chatgpt.com 处理
+  // Auth：这是 OAuth flow 本身，不需要代理密钥
+  if (route !== "codex" && route !== "auth") {
     const authError = verifyClient(req, requestId);
     if (authError) {
       return errorResponse(authError, 401, requestId);
     }
     console.log(`[${requestId}] 认证成功 → 路由: ${route}`);
   } else {
-    console.log(`[${requestId}] Codex 路由 → 跳过代理认证，透传 OAuth token`);
+    console.log(`[${requestId}] ${route} 路由 → 跳过代理认证`);
   }
 
   if (route === "openai") {
@@ -433,6 +509,9 @@ async function handler(req: Request): Promise<Response> {
   }
   if (route === "codex") {
     return proxyCodex(req, url, requestId);
+  }
+  if (route === "auth") {
+    return proxyAuth(req, url, requestId);
   }
 
   return errorResponse("未知路由", 404, requestId);
