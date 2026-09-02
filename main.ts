@@ -14,6 +14,16 @@ const OPENAI_API_KEYS_STR = Deno.env.get("openai_apikey"); // OpenAI API 密钥�
 const GEMINI_API_KEYS_STR = Deno.env.get("gemini_apikey"); // Gemini API 密钥（逗号分隔）
 const OPENAI_BASE_URL = Deno.env.get("openai_base_url") || "https://api.openai.com";
 const GEMINI_BASE_URL = Deno.env.get("gemini_base_url") || "https://generativelanguage.googleapis.com";
+// 2026-09-02: Google 封锁 Deno Deploy 出口 IP 访问 generativelanguage.googleapis.com（实测 0/10 连接重置），
+// 且 Vertex (aiplatform.googleapis.com) 不接受 API key（401 "API keys are not supported"）。
+// 因此 /gemini/* 默认改走 gpt.ge 中继（Gemini 原生格式，Authorization Bearer 认证）。
+// 启用条件：环境变量 gemini_relay_key，或部署时把 __RELAY_KEY__ 占位符替换为真实 key（见 deploy.sh）。
+const GEMINI_RELAY_BASE = Deno.env.get("gemini_relay_base") || "https://api.gpt.ge";
+const GEMINI_RELAY_KEY = Deno.env.get("gemini_relay_key") || "__RELAY_KEY__";
+// gpt.ge 上没有的模型名 → 等价可用名（仅中继模式生效）
+const GEMINI_MODEL_ALIASES: Record<string, string> = {
+  "gemini-3.5-flash-lite-preview": "gemini-3.5-flash-lite",
+};
 const CODEX_BASE_URL = Deno.env.get("codex_base_url") || "https://chatgpt.com/backend-api/codex";
 const AUTH_BASE_URL = "https://auth.openai.com";
 
@@ -43,6 +53,7 @@ console.log(`OpenAI Keys: ${OPENAI_API_KEYS.length} 个`);
 console.log(`Gemini Keys: ${GEMINI_API_KEYS.length} 个`);
 console.log(`OpenAI 后端: ${OPENAI_BASE_URL}`);
 console.log(`Gemini 后端: ${GEMINI_BASE_URL}`);
+console.log(`Gemini 中继: ${GEMINI_RELAY_KEY !== "__RELAY_KEY__" && GEMINI_RELAY_KEY.length > 0 ? `${GEMINI_RELAY_BASE} (启用)` : "未启用（直连模式）"}`);
 console.log(`Codex 后端: ${CODEX_BASE_URL}`);
 console.log("================================");
 console.log("路由: /openai/* → OpenAI | /gemini/* → Gemini | /codex/* → Codex | /auth/* → Auth | /v1/* → OpenAI(兼容)");
@@ -101,7 +112,7 @@ function verifyClient(req: Request, requestId: string): string | null {
 }
 
 // ── 路由解析 ──
-type RouteTarget = "openai" | "gemini" | "codex" | "auth" | "help";
+type RouteTarget = "openai" | "gemini" | "codex" | "auth" | "fetch" | "help";
 
 function resolveRoute(pathname: string): RouteTarget {
   if (pathname.startsWith("/openai/") || pathname === "/openai") return "openai";
@@ -110,6 +121,7 @@ function resolveRoute(pathname: string): RouteTarget {
   if (pathname.startsWith("/auth/")) return "auth";
   // /v1/ 默认走 OpenAI（向后兼容原 openai-proxy）
   if (pathname.startsWith("/v1/")) return "openai";
+  if (pathname.startsWith("/fetch") || pathname === "/fetch") return "fetch";
   return "help";
 }
 
@@ -182,15 +194,25 @@ async function proxyGemini(
   url: URL,
   requestId: string,
 ): Promise<Response> {
-  if (GEMINI_API_KEYS.length === 0) {
+  const useRelay = GEMINI_RELAY_KEY.length > 0 && GEMINI_RELAY_KEY !== "__RELAY_KEY__";
+  console.log(`[${requestId}] Gemini 上游: ${useRelay ? `中继 ${GEMINI_RELAY_BASE}` : `直连 ${GEMINI_BASE_URL}`}`);
+
+  if (!useRelay && GEMINI_API_KEYS.length === 0) {
     return errorResponse("Gemini API Keys 未配置", 500, requestId);
   }
 
-  const geminiRef = { value: geminiKeyIndex };
-  const selectedKey = getNextKey(GEMINI_API_KEYS, geminiRef);
-  geminiKeyIndex = geminiRef.value;
-  const keyNum = GEMINI_API_KEYS.indexOf(selectedKey) + 1;
-  console.log(`[${requestId}] 使用 Gemini Key #${keyNum}/${GEMINI_API_KEYS.length}`);
+  let selectedKey = "";
+  let totalKeys = GEMINI_API_KEYS.length;
+  if (useRelay) {
+    selectedKey = GEMINI_RELAY_KEY;
+    totalKeys = 1;
+  } else {
+    const geminiRef = { value: geminiKeyIndex };
+    selectedKey = getNextKey(GEMINI_API_KEYS, geminiRef);
+    geminiKeyIndex = geminiRef.value;
+    const keyNum = GEMINI_API_KEYS.indexOf(selectedKey) + 1;
+    console.log(`[${requestId}] 使用 Gemini Key #${keyNum}/${GEMINI_API_KEYS.length}`);
+  }
 
   // 去掉路径前缀 /gemini
   let targetPath = url.pathname;
@@ -199,11 +221,21 @@ async function proxyGemini(
   }
   if (targetPath === "") targetPath = "/v1beta/models/gemini-pro:generateContent";
 
-  // 替换 URL 中的 key 参数
+  // 中继模式：把 gpt.ge 没有的模型名映射为等价可用名
+  if (useRelay) {
+    targetPath = targetPath.replace(
+      /\/models\/([^:/?]+)([:/?]|$)/,
+      (m, name: string, tail: string) =>
+        GEMINI_MODEL_ALIASES[name] ? `/models/${GEMINI_MODEL_ALIASES[name]}${tail}` : m,
+    );
+  }
+
+  // 组装上游 URL（剥掉客户端传来的 key 参数；直连模式才注入 ?key=）
   const searchParams = new URLSearchParams(url.search);
   searchParams.delete("key");
-  searchParams.set("key", selectedKey);
-  const targetUrl = `${GEMINI_BASE_URL}${targetPath}?${searchParams.toString()}`;
+  if (!useRelay) searchParams.set("key", selectedKey);
+  const upstreamBase = useRelay ? GEMINI_RELAY_BASE : GEMINI_BASE_URL;
+  const targetUrl = `${upstreamBase}${targetPath}?${searchParams.toString()}`;
   console.log(`[${requestId}] Gemini 转发: ${targetPath}`);
 
   // 准备转发 headers
@@ -215,6 +247,8 @@ async function proxyGemini(
     const v = req.headers.get(h);
     if (v) forwardHeaders.set(h, v);
   }
+  // 中继模式用 Bearer 认证（gpt.ge 不认 ?key= 参数）
+  if (useRelay) forwardHeaders.set("Authorization", `Bearer ${selectedKey}`);
 
   // 读取请求体
   let body: ArrayBuffer | undefined;
@@ -226,17 +260,25 @@ async function proxyGemini(
   const isStream = url.searchParams.get("alt") === "sse";
 
   const startTime = Date.now();
-  const resp = await fetch(targetUrl, {
-    method: req.method,
-    headers: forwardHeaders,
-    body,
-  });
+  let resp: Response;
+  try {
+    resp = await fetch(targetUrl, {
+      method: req.method,
+      headers: forwardHeaders,
+      body,
+    });
+  } catch (e) {
+    const elapsed = Date.now() - startTime;
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[${requestId}] Gemini 上游请求失败 (${elapsed}ms): ${msg}`);
+    return errorResponse(`Gemini 上游请求失败: ${msg}`, 502, requestId);
+  }
   const elapsed = Date.now() - startTime;
 
   console.log(`[${requestId}] Gemini 响应: ${resp.status} (${elapsed}ms)`);
   if (resp.status === 429) console.warn(`[${requestId}] ⚠️ Key 限速`);
 
-  return buildResponse(resp, requestId, isStream, elapsed, GEMINI_API_KEYS.length, selectedKey);
+  return buildResponse(resp, requestId, isStream, elapsed, totalKeys, selectedKey);
 }
 
 // ── Codex 代理逻辑（新增） ──
@@ -388,6 +430,77 @@ async function proxyAuth(
   return new Response(resp.body, { status: resp.status, headers });
 }
 
+
+// ── 通用 Web Fetch 代理 ──
+// 从 Deno 边缘节点发起请求，绕过地域 IP 封锁
+// 用法: GET /fetch?url=<encoded_url>
+async function proxyFetch(
+  req: Request,
+  url: URL,
+  requestId: string,
+): Promise<Response> {
+  const targetUrl = url.searchParams.get("url");
+  if (!targetUrl) {
+    return errorResponse("缺少 url 参数。用法: /fetch?url=<encoded_url>", 400, requestId);
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return errorResponse(`无效的 URL: ${targetUrl}`, 400, requestId);
+  }
+
+  // 安全限制：仅允许 https
+  if (parsed.protocol !== "https:") {
+    return errorResponse("仅允许 https 目标", 403, requestId);
+  }
+
+  console.log(`[${requestId}] fetch → ${parsed.href}`);
+
+  const startTime = Date.now();
+  let resp: Response;
+  try {
+    // 转发请求的 Cookie header（用于需要认证的请求）
+    const fetchHeaders: Record<string, string> = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
+    };
+    const reqCookie = req.headers.get("Cookie");
+    if (reqCookie) fetchHeaders["Cookie"] = reqCookie;
+    const reqAuth = req.headers.get("Authorization");
+    if (reqAuth) fetchHeaders["Authorization"] = reqAuth;
+
+    resp = await fetch(parsed.href, {
+      method: "GET",
+      headers: fetchHeaders,
+      redirect: "follow",
+    });
+  } catch (e) {
+    const elapsed = Date.now() - startTime;
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[${requestId}] fetch 失败 (${elapsed}ms): ${msg}`);
+    return errorResponse(`fetch 失败: ${msg}`, 502, requestId);
+  }
+
+  const elapsed = Date.now() - startTime;
+  console.log(`[${requestId}] fetch 完成 ${resp.status} (${elapsed}ms)`);
+
+  const headers = new Headers();
+  // 同 buildResponse：不转发 Content-Length / Content-Encoding（Deno fetch 已解压，转发会错位）
+  for (const h of ["Content-Type", "Last-Modified", "ETag"]) {
+    const v = resp.headers.get(h);
+    if (v) headers.set(h, v);
+  }
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("X-Proxy-Request-ID", requestId);
+  headers.set("X-Fetch-Status", `${resp.status}`);
+  headers.set("X-Response-Time", `${elapsed}ms`);
+
+  return new Response(resp.body, { status: resp.status, headers });
+}
+
 // ── 构建统一响应 ──
 function buildResponse(
   resp: Response,
@@ -398,10 +511,11 @@ function buildResponse(
   usedKey: string,
 ): Response {
   const headers = new Headers();
-  for (const h of ["Content-Type", "Content-Length", "Content-Encoding", "Transfer-Encoding"]) {
-    const v = resp.headers.get(h);
-    if (v) headers.set(h, v);
-  }
+  // 注意：Deno fetch 已自动解压 body，上游的 content-length / content-encoding 是压缩前的值，
+  // 原样转发会导致客户端解码错位（表现为空响应，2026-09-02 实测定位）。
+  // 只转发 Content-Type，长度/编码头交给运行时重新生成。
+  const ct = resp.headers.get("Content-Type");
+  if (ct) headers.set("Content-Type", ct);
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("X-Proxy-Request-ID", requestId);
   headers.set("X-Response-Time", `${elapsed}ms`);
@@ -459,6 +573,11 @@ function helpResponse(): Response {
           example: "POST /v1/chat/completions",
           note: "直接转发到 OpenAI，向后兼容",
         },
+        "/fetch": {
+          target: "通用 Web Fetch 代理（Deno 边缘节点出口）",
+          example: "GET /fetch?url=https%3A%2F%2Finvestor.tsmc.com%2Fenglish%2Fmonthly-revenue",
+          note: "用于绕过地域 IP 封锁，仅允许 https，需要 AUTH_KEY",
+        },
       },
       auth: "所有请求都需要在 Authorization/x-api-key/x-goog-api-key 中携带认证密钥",
     }),
@@ -512,6 +631,9 @@ async function handler(req: Request): Promise<Response> {
   }
   if (route === "auth") {
     return proxyAuth(req, url, requestId);
+  }
+  if (route === "fetch") {
+    return proxyFetch(req, url, requestId);
   }
 
   return errorResponse("未知路由", 404, requestId);

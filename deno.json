@@ -4,6 +4,7 @@
     "deploy": "deno deploy --allow-net --allow-env main.ts"
   },
   "deploy": {
-    "entrypoint": "main.ts"
+    "org": "kevinsutianxing",
+    "app": "gemini-proxy"
   }
 }

@@ -1,0 +1,3 @@
+deploy_entry.ts
+*.bak.*
+__pycache__/
