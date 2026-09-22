@@ -1,7 +1,7 @@
 {
   "tasks": {
     "start": "deno run --allow-net --allow-env main.ts",
-    "deploy": "deno deploy --allow-net --allow-env main.ts"
+    "deploy": "deno deploy"
   },
   "deploy": {
     "org": "kevinsutianxing",

@@ -112,7 +112,7 @@ function verifyClient(req: Request, requestId: string): string | null {
 }
 
 // ── 路由解析 ──
-type RouteTarget = "openai" | "gemini" | "codex" | "auth" | "fetch" | "help";
+type RouteTarget = "openai" | "gemini" | "codex" | "auth" | "fetch" | "tcp-relay" | "help";
 
 function resolveRoute(pathname: string): RouteTarget {
   if (pathname.startsWith("/openai/") || pathname === "/openai") return "openai";
@@ -122,6 +122,7 @@ function resolveRoute(pathname: string): RouteTarget {
   // /v1/ 默认走 OpenAI（向后兼容原 openai-proxy）
   if (pathname.startsWith("/v1/")) return "openai";
   if (pathname.startsWith("/fetch") || pathname === "/fetch") return "fetch";
+  if (pathname === "/relay") return "tcp-relay";
   return "help";
 }
 
@@ -431,6 +432,51 @@ async function proxyAuth(
 }
 
 
+// ── ChatGPT Web TCP relay（浏览器真实 TLS 通过 Deno 边缘出口）──
+const TCP_RELAY_TOKEN = Deno.env.get("tcp_relay_token") ?? "";
+async function tcpRelay(req: Request): Promise<Response> {
+  if (!TCP_RELAY_TOKEN || req.headers.get("authorization") !== `Bearer ${TCP_RELAY_TOKEN}`) {
+    return errorResponse("unauthorized", 401, crypto.randomUUID());
+  }
+  if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    return errorResponse("websocket required", 426, crypto.randomUUID());
+  }
+  const { socket, response } = Deno.upgradeWebSocket(req);
+  let tcp: Deno.TcpConn | null = null;
+  let writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  socket.onopen = () => socket.send(new TextEncoder().encode("RELAY_READY"));
+  socket.onmessage = async (event) => {
+    const eventBytes = event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : new Uint8Array();
+    if (!writer) {
+      const header = new TextDecoder().decode(eventBytes.slice(0, 512));
+      const match = header.match(/^CONNECT ([^\s:]+):(\d+)\n/);
+      if (!match) return socket.close(1002, "bad protocol");
+      const hostname = match[1];
+      const port = Number(match[2]);
+      if ((hostname !== "chatgpt.com" && hostname !== "auth.openai.com") || port !== 443) {
+        return socket.close(1002, "target not allowed");
+      }
+      tcp = await Deno.connect({ hostname, port });
+      const conn = tcp as unknown as {
+        readable: ReadableStream<Uint8Array>;
+        writable: WritableStream<Uint8Array>;
+      };
+      writer = conn.writable.getWriter();
+      (async () => {
+        try {
+          for await (const chunk of conn.readable) socket.send(chunk as Uint8Array);
+          socket.close(1000);
+        } catch { socket.close(1011); }
+      })();
+      return;
+    }
+    if (eventBytes.length) await writer.write(eventBytes);
+  };
+  socket.onclose = () => tcp?.close();
+  socket.onerror = () => tcp?.close();
+  return response;
+}
+
 // ── 通用 Web Fetch 代理 ──
 // 从 Deno 边缘节点发起请求，绕过地域 IP 封锁
 // 用法: GET /fetch?url=<encoded_url>
@@ -634,6 +680,9 @@ async function handler(req: Request): Promise<Response> {
   }
   if (route === "fetch") {
     return proxyFetch(req, url, requestId);
+  }
+  if (route === "tcp-relay") {
+    return await tcpRelay(req);
   }
 
   return errorResponse("未知路由", 404, requestId);
